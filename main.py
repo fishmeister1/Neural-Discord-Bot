@@ -96,6 +96,67 @@ class SupabaseConfig:
     def clear_cache(self):
         """Clear the environment variable cache"""
         self._env_cache.clear()
+    
+    async def get_user_conversation(self, user_id: int) -> list:
+        """Get user's conversation history from Supabase"""
+        if self.storage_mode != 'supabase' or not self.supabase:
+            return []
+        
+        try:
+            response = self.supabase.table('user_conversations')\
+                .select('messages')\
+                .eq('user_id', str(user_id))\
+                .execute()
+            
+            if response.data and len(response.data) > 0:
+                messages = response.data[0]['messages']
+                logger.info(f"Retrieved {len(messages)} messages for user {user_id}")
+                return messages
+            else:
+                logger.info(f"No conversation history found for user {user_id}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Error retrieving conversation for user {user_id}: {e}")
+            return []
+    
+    async def save_user_conversation(self, user_id: int, messages: list) -> bool:
+        """Save user's conversation history to Supabase"""
+        if self.storage_mode != 'supabase' or not self.supabase:
+            return False
+        
+        try:
+            # Upsert the conversation
+            response = self.supabase.table('user_conversations').upsert({
+                'user_id': str(user_id),
+                'messages': messages,
+                'updated_at': 'now()'
+            }).execute()
+            
+            logger.info(f"Successfully saved conversation for user {user_id} ({len(messages)} messages)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error saving conversation for user {user_id}: {e}")
+            return False
+    
+    async def clear_user_conversation(self, user_id: int) -> bool:
+        """Clear user's conversation history from Supabase"""
+        if self.storage_mode != 'supabase' or not self.supabase:
+            return False
+        
+        try:
+            response = self.supabase.table('user_conversations')\
+                .delete()\
+                .eq('user_id', str(user_id))\
+                .execute()
+            
+            logger.info(f"Successfully cleared conversation for user {user_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error clearing conversation for user {user_id}: {e}")
+            return False
 
 # Initialize configuration
 config = SupabaseConfig()
@@ -116,8 +177,8 @@ class NeuralBot(commands.Bot):
         self.ai_model = None
         self.config_loaded = False
         
-        # Store conversation history (in production, use a database)
-        self.conversations = {}
+        # Store conversation history (local cache + Supabase)
+        self.conversations = {}  # Local cache for performance
         
         # AI response embed colors
         self.embed_colors = [
@@ -203,22 +264,30 @@ class NeuralBot(commands.Bot):
             )
     
     async def get_ai_response(self, user_id: int, message: str) -> str:
-        """Get AI response from Groq API"""
+        """Get AI response from Groq API with Supabase conversation storage"""
         try:
-            # Get or create conversation history for user
+            # Get or load conversation history for user
             if user_id not in self.conversations:
-                self.conversations[user_id] = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are Neural, an intelligent and helpful Discord bot. "
-                            "You're enthusiasticand always try to be helpful. "
-                            "Keep responses concise but informative. "
-                            "If someone asks about your capabilities, mention that you can chat, "
-                            "help with questions, and provide information on various topics."
-                        )
-                    }
-                ]
+                # Try to load from Supabase first
+                saved_conversation = await config.get_user_conversation(user_id)
+                
+                if saved_conversation:
+                    self.conversations[user_id] = saved_conversation
+                    logger.info(f"Loaded conversation history for user {user_id} from Supabase")
+                else:
+                    # Create new conversation with system message
+                    self.conversations[user_id] = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are Neural, an intelligent and helpful Discord bot. "
+                                "You're enthusiastic and always try to be helpful. "
+                                "Keep responses concise but informative. "
+                                "If someone asks about your capabilities, mention that you can chat, "
+                                "help with questions, and provide information on various topics."
+                            )
+                        }
+                    ]
             
             # Add user message to conversation
             self.conversations[user_id].append({
@@ -226,7 +295,7 @@ class NeuralBot(commands.Bot):
                 "content": message
             })
             
-            # Keep conversation history manageable (last 20 messages)
+            # Keep conversation history manageable (last 20 messages + system message)
             if len(self.conversations[user_id]) > 21:  # 1 system + 20 messages
                 self.conversations[user_id] = (
                     [self.conversations[user_id][0]] +  # Keep system message
@@ -249,6 +318,9 @@ class NeuralBot(commands.Bot):
                 "content": ai_response
             })
             
+            # Save updated conversation to Supabase (async, don't wait)
+            asyncio.create_task(config.save_user_conversation(user_id, self.conversations[user_id]))
+            
             return ai_response
             
         except Exception as e:
@@ -270,11 +342,10 @@ async def chat(interaction: discord.Interaction, message: str):
         
         # Create embed for response
         embed = discord.Embed(
-            title="Neural's Response",
             description=ai_response,
             color=bot.get_random_embed_color()
         )
-        embed.set_footer(text=f"Asked by {interaction.user.display_name}")
+        embed.set_footer(text=f"✦ Neural Response")
         
         await interaction.followup.send(embed=embed)
         
@@ -287,15 +358,38 @@ async def chat(interaction: discord.Interaction, message: str):
 
 @bot.tree.command(name="clear", description="Clear your conversation history with Neural")
 async def clear_history(interaction: discord.Interaction):
-    """Clear user's conversation history"""
+    """Clear user's conversation history from both local cache and Supabase"""
     user_id = interaction.user.id
     
-    if user_id in bot.conversations:
+    # Clear from local cache
+    local_cleared = user_id in bot.conversations
+    if local_cleared:
         del bot.conversations[user_id]
-        await interaction.response.send_message(
-            "✅ Your conversation history has been cleared! 🧹",
-            ephemeral=True
+    
+    # Clear from Supabase
+    supabase_cleared = await config.clear_user_conversation(user_id)
+    
+    if local_cleared or supabase_cleared:
+        embed = discord.Embed(
+            title="✅ History Cleared",
+            description="Your conversation history has been cleared! 🧹",
+            color=0x00ff88
         )
+        
+        details = []
+        if local_cleared:
+            details.append("• Local cache cleared")
+        if supabase_cleared:
+            details.append("• Supabase records cleared")
+        
+        if details:
+            embed.add_field(
+                name="Cleared from:",
+                value="\n".join(details),
+                inline=False
+            )
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
     else:
         await interaction.response.send_message(
             "🤷 You don't have any conversation history to clear!",
